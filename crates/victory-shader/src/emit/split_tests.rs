@@ -1063,3 +1063,23 @@ fn a_mask_copied_dword_by_dword_stops_instead_of_recursing() {
         assert!(e.contains(why), "{lanes_min}..{lanes_max}: {e}");
     }
 }
+
+/// `s_*_saveexec` writes the old EXEC to its scalar destination and the new
+/// EXEC to EXEC, and sets SCC to whether the *new* EXEC is non-zero. In
+/// console flow, `s_cbranch_scc0` after `s_and_saveexec_b64` must branch on
+/// the new EXEC (0 here), not the saved old EXEC (all lanes active).
+#[test]
+fn saveexec_scc_tests_new_exec_not_saved_exec() {
+    let body = [
+        0xBE89_03AA, // s_mov_b32 s9, 42
+        0x7D88_0080, // v_cmp_gt_u32 vcc, 0, v0 (false in every lane)
+        0xBE8C_246A, // s_and_saveexec_b64 s[12:13], vcc (old != 0, new == 0 -> SCC = 0)
+        0xBF84_0003, // s_cbranch_scc0 +3 (must skip the body)
+        0xD760_000E,
+        0x0001_1500, // v_readlane_b32 s14, v0, 10 (takes the console flow)
+        0xBE89_03BC, // s_mov_b32 s9, 60 (must not run)
+        0x88FE_0C7E, // s_or_b64 exec, exec, s[12:13]
+        0x7E04_0209, // v_mov_b32 v2, s9
+    ];
+    console_flow_case("saveexec SCC tests new EXEC", &body, 64, |_| 42);
+}
