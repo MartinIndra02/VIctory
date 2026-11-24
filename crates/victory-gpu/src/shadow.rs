@@ -10,10 +10,15 @@
 //! in its copy. Ranges shaders write go back to title memory after the
 //! submission ([`Shadow::gpu_writes`]).
 //!
-//! shortcut: only the ranges draws are known to read are brought up to
-//! date (vertex and index buffer views, constant buffers in tables, root
-//! descriptors, buffer views in tables); buffers read through directly
-//! indexed heaps keep what their first use copied.
+//! The ranges draws are known to read are brought up to date (vertex and
+//! index buffer views, constant buffers in tables, root descriptors, buffer
+//! views in tables). A shader that picks a buffer view's heap slot when it
+//! runs names no range: for a submission running one, what every buffer
+//! view of its view heap reads is brought up to date
+//! ([`crate::descriptor::host::ReachedPlan`]).
+//!
+//! shortcut: constant buffers (and textures in memory the title placed
+//! itself) in slots only reached that way keep what their first use copied.
 
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicU8, Ordering};
@@ -97,6 +102,17 @@ impl Shadow {
     /// Offset of a title address from the buffer's start.
     pub(crate) fn offset(&self, address: u64) -> u64 {
         address - self.start
+    }
+
+    /// `[address, address + len)` widened to the whole 64 KiB pages of
+    /// title memory it touches, cut to the buffer (address, bytes). A
+    /// refresh of whole pages leaves none of them stale in part, which
+    /// every later refresh would copy again.
+    pub(crate) fn whole_pages(&self, address: usize, len: usize) -> (usize, usize) {
+        let (start, end) = (self.start as usize, (self.start + self.len) as usize);
+        let from = (address / PAGE * PAGE).max(start);
+        let to = (address + len).div_ceil(PAGE).saturating_mul(PAGE).min(end);
+        (from, to.saturating_sub(from))
     }
 
     /// Brings `len` bytes at `address` up to date when `list` is submitted,

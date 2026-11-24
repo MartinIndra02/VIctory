@@ -13,19 +13,19 @@ use super::View;
 use super::host::HostHeap;
 use crate::host::host;
 
-const R32_TYPELESS: u32 = 39;
-const R32G32B32A32_FLOAT: u32 = 2;
+pub(super) const R32_TYPELESS: u32 = 39;
+pub(super) const R32G32B32A32_FLOAT: u32 = 2;
 /// `D3D12_BUFFER_SRV_FLAG_RAW` and `D3D12_BUFFER_UAV_FLAG_RAW`.
-const RAW: u32 = 1;
+pub(super) const RAW: u32 = 1;
 /// Bytes of each title buffer below.
-const WIDTH: u32 = 0x1000;
+pub(super) const WIDTH: u32 = 0x1000;
 /// Title memory outside buffer objects is copied in windows of this size.
-const WINDOW: u64 = 4 << 20;
+pub(super) const WINDOW: u64 = 4 << 20;
 
 /// A buffer view of memory the title placed itself: `count` elements from
 /// element `first` of the buffer at `address`, in `format` (0 with a
 /// `stride` for a structured view, typeless with [`RAW`] for a raw one).
-fn placed(
+pub(super) fn placed(
     unordered: bool,
     address: u64,
     (format, stride, flags): (u32, u32, u32),
@@ -57,28 +57,37 @@ fn placed(
 /// `[lane, 16 * group]` of the view in table slot 1, neither with a stride
 /// known at translation.
 fn program() -> HostShader {
-    let words: &[u32] = &[
-        0xBE94_0304, // s_mov_b32 s20, s4
-        0xBE95_0380, // s_mov_b32 s21, 0
-        0xF408_040A,
-        0xFA00_0000, // s_load_dwordx4 s[16:19], s[20:21], 0x0
-        0x8F07_8205, // s_lshl_b32 s7, s5, 2
-        0xF420_0188,
-        0x0E00_0000, // s_buffer_load_dword s6, s[16:19], s7
-        0x8F06_8506, // s_lshl_b32 s6, s6, 5
-        0xF408_020A,
-        0x0C00_0000, // s_load_dwordx4 s[8:11], s[20:21], s6
-        0xF408_030A,
-        0xFA00_0020, // s_load_dwordx4 s[12:15], s[20:21], 0x20
-        0x7E02_0284, // v_mov_b32 v1, 4
-        0xE030_3000,
-        0x8002_0200, // buffer_load_dword v2, v[0:1], s[8:11], 0 idxen offen
-        0x8F07_8405, // s_lshl_b32 s7, s5, 4
-        0x7E02_0207, // v_mov_b32 v1, s7
-        0xE070_3000,
-        0x8003_0200, // buffer_store_dword v2, v[0:1], s[12:15], 0 idxen offen
-        0xBF81_0000, // s_endpgm
-    ];
+    translate(LOADED_SLOT_READ, [ResourceType::Srv, ResourceType::Uav]).0
+}
+
+/// [`program`]'s code.
+pub(super) const LOADED_SLOT_READ: &[u32] = &[
+    0xBE94_0304, // s_mov_b32 s20, s4
+    0xBE95_0380, // s_mov_b32 s21, 0
+    0xF408_040A,
+    0xFA00_0000, // s_load_dwordx4 s[16:19], s[20:21], 0x0
+    0x8F07_8205, // s_lshl_b32 s7, s5, 2
+    0xF420_0188,
+    0x0E00_0000, // s_buffer_load_dword s6, s[16:19], s7
+    0x8F06_8506, // s_lshl_b32 s6, s6, 5
+    0xF408_020A,
+    0x0C00_0000, // s_load_dwordx4 s[8:11], s[20:21], s6
+    0xF408_030A,
+    0xFA00_0020, // s_load_dwordx4 s[12:15], s[20:21], 0x20
+    0x7E02_0284, // v_mov_b32 v1, 4
+    0xE030_3000,
+    0x8002_0200, // buffer_load_dword v2, v[0:1], s[8:11], 0 idxen offen
+    0x8F07_8405, // s_lshl_b32 s7, s5, 4
+    0x7E02_0207, // v_mov_b32 v1, s7
+    0xE070_3000,
+    0x8003_0200, // buffer_store_dword v2, v[0:1], s[12:15], 0 idxen offen
+    0xBF81_0000, // s_endpgm
+];
+
+/// The translation of the compute program `words` (four threads a group,
+/// user data `s0..s3`, a table at `s4`), with the used-resource entries it
+/// is given: the table's first two slots, of `kinds`.
+pub(super) fn translate(words: &[u32], kinds: [ResourceType; 2]) -> (HostShader, Vec<UsedResource>) {
     let used = |kind, table_offset_dwords| UsedResource {
         kind,
         root: RootType::Table,
@@ -105,7 +114,7 @@ fn program() -> HostShader {
             param(RootType::Constants, 4, 0, 0),
             param(RootType::Table, 1, 4, 1),
         ],
-        used: vec![used(ResourceType::Srv, 0), used(ResourceType::Uav, 8)],
+        used: vec![used(kinds[0], 0), used(kinds[1], 8)],
         // Four threads (v0: the thread's id), the group's id in s5 after
         // the user SGPRs s0..s4.
         io: StageIo::Cs(ComputeIo {
@@ -126,7 +135,7 @@ fn program() -> HostShader {
     let c = victory_shader::Container::parse(&container).unwrap();
     let cs = victory_shader::emit::emit(&c, &native, &p, &st, &io, &res).unwrap();
     assert!(cs.stride_table);
-    cs
+    (cs, native.used)
 }
 
 /// The root signature and pipeline of `cs`: its user data as root constants

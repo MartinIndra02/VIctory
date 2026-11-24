@@ -14,6 +14,8 @@ use crate::resource::{Memory, PAGEABLE_IIDS};
 pub(crate) mod host;
 #[cfg(all(test, windows))]
 mod raw_view_tests;
+#[cfg(all(test, windows))]
+mod run_time_slot_tests;
 
 const HEAP_IIDS: [Iid; 4] = [
     guid(
@@ -145,6 +147,20 @@ fn mirror(handle: u64) {
             }
         }
     }
+}
+
+/// What a submission running a shader that picks view-heap slots when it
+/// runs does for the buffer views of the title heap at `heap`, as its host
+/// heap holds them now; none if that heap is gone (or has no host heap).
+#[cfg(windows)]
+pub(crate) fn reached_plan(heap: usize) -> Option<std::sync::Arc<host::ReachedPlan>> {
+    let heaps = SHADER_HEAPS.lock().unwrap_or_else(|e| e.into_inner());
+    if !heaps.iter().any(|&(_, _, h)| h == heap) {
+        return None;
+    }
+    // SAFETY: registered heaps are live (removed when dropped).
+    let host = unsafe { &*(heap as *const Heap) }.host.get()?.as_ref()?;
+    Some(host.reached_plan())
 }
 
 /// Gives back dynamic slots of the host heap behind the title heap at
@@ -381,12 +397,38 @@ fn record(handle: u64, view: View) {
     mirror(handle);
 }
 
+/// How many resources with views the title has released: host slots made
+/// from views may be stale when it changes.
+static RELEASED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// [`RELEASED`], read before looking for stale views.
+#[cfg(windows)]
+fn released() -> u64 {
+    RELEASED.load(std::sync::atomic::Ordering::Acquire)
+}
+
+/// Of `slots` (a heap slot and the record it was made from), those whose
+/// view went stale: one look at the views for all of them.
+#[cfg(windows)]
+fn stale(slots: impl Iterator<Item = (u32, u64)>) -> Vec<(u32, u64)> {
+    let views = VIEWS.lock().unwrap_or_else(|e| e.into_inner());
+    slots
+        .filter(|&(_, key)| {
+            views
+                .list
+                .get(key as u32 as usize)
+                .is_none_or(|(_, generation)| *generation != (key >> 32) as u32)
+        })
+        .collect()
+}
+
 /// The title released `resource`: the views naming it go stale.
 pub(crate) fn forget(resource: usize) {
     let mut views = VIEWS.lock().unwrap_or_else(|e| e.into_inner());
     let Some(entries) = views.by_resource.remove(&resource) else {
         return;
     };
+    RELEASED.fetch_add(1, std::sync::atomic::Ordering::Release);
     for i in entries {
         let (view, generation) = views.list[i as usize].clone();
         // Entries freed through a view's other resource may hold another

@@ -82,6 +82,15 @@ pub(crate) static PREPARING: [std::sync::atomic::AtomicU64; 4] = [
     std::sync::atomic::AtomicU64::new(0),
 ];
 
+/// For shaders that pick their buffer view at run time: heaps whose views'
+/// memory a submission brought up to date, the host copies' ranges checked
+/// for that, and the bytes copied, since the start.
+pub(crate) static REACHED: [std::sync::atomic::AtomicU64; 3] = [
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+];
+
 /// What the runtime does when the host GPU fails for good: report it like a
 /// crash and end the run. The console has no such state, and carrying on
 /// draws nothing at seconds per frame.
@@ -382,6 +391,13 @@ enum Step {
     Host(Box<dyn Fn() + Send>),
     /// Shaders write a range (address, bytes) of a buffer's host copy.
     GpuWrite(std::sync::Arc<crate::shadow::Shadow>, usize, usize),
+    /// Shaders of the list pick buffer views of a view heap (the title's
+    /// heap object) when they run: the title memory every buffer view of
+    /// the heap reads is brought up to date, as the heap holds them at
+    /// submission (a slot's view is the one the title wrote last, as on
+    /// the console), and with `true` what shaders may write through its
+    /// unordered access views goes back to title memory.
+    Reached(usize, bool),
     /// Brings a texture's staging buffer up to date: once per submission,
     /// whichever lists sample it, until a `Copy` or `Run` intervenes.
     Texture(std::sync::Arc<crate::texture::Staging>),
@@ -402,6 +418,12 @@ struct Deferred {
     /// Buffer ranges refreshed since the last title copy (host copy,
     /// address, bytes): refreshing them again would find the same bytes.
     refreshed: std::collections::HashSet<(usize, usize, usize)>,
+    /// [`Step::Reached`] steps since the last title copy: heap, writes.
+    reached: Vec<(usize, bool)>,
+    /// What the last submission's `Reached` steps found in their heaps:
+    /// held while the list may run (the host copies the views read), and
+    /// the ranges to copy back.
+    reached_plans: Vec<(std::sync::Arc<crate::descriptor::host::ReachedPlan>, bool)>,
     /// Textures whose contents the list brings up to date.
     textures: std::collections::HashSet<usize>,
     /// Bottom-of-pipe writes, done once the list has run: address, what,
@@ -587,6 +609,18 @@ impl Host {
                         .any(|(s, a, l)| std::sync::Arc::ptr_eq(s, shadow) && (*a, *l) == (*address, *len))
                 {
                     back.push((shadow.clone(), *address, *len));
+                }
+            }
+            // What shaders that pick their views at run time may have
+            // written, as declared when the list's steps ran.
+            for (plan, writes) in &list.deferred().reached_plans {
+                for (shadow, address, len) in plan.writes.iter().filter(|_| *writes) {
+                    if !back
+                        .iter()
+                        .any(|(s, a, l)| std::sync::Arc::ptr_eq(s, shadow) && (*a, *l) == (*address, *len))
+                    {
+                        back.push((shadow.clone(), *address, *len));
+                    }
                 }
             }
         }
@@ -1017,6 +1051,7 @@ impl HostList {
             .copies
             .push(Step::Copy(dst as usize, src as usize, len));
         deferred.refreshed.clear();
+        deferred.reached.clear();
     }
 
     /// Copies `len` bytes of title memory at `src` into the list's upload
@@ -1043,6 +1078,23 @@ impl HostList {
                 .copies
                 .push(Step::Refresh(shadow.clone(), address, len));
         }
+    }
+
+    /// Shaders of the list pick buffer views of the title view heap at
+    /// `heap` when they run (and with `writes` may write through them):
+    /// what every buffer view of the heap reads is brought up to date when
+    /// the list is submitted, once until a title copy intervenes.
+    pub(crate) fn defer_reached(&self, heap: usize, writes: bool) {
+        let mut deferred = self.deferred();
+        if deferred
+            .reached
+            .iter()
+            .any(|&(h, w)| h == heap && (w || !writes))
+        {
+            return;
+        }
+        deferred.reached.push((heap, writes));
+        deferred.copies.push(Step::Reached(heap, writes));
     }
 
     /// Shaders of the list write `[address, address + len)` of a buffer's
@@ -1144,8 +1196,10 @@ impl HostList {
     /// Runs `work` when the list is submitted, in order with its copies.
     /// `work` may write title memory (refreshes after it copy again).
     pub(crate) fn defer(&self, work: impl Fn() + Send + 'static) {
-        self.deferred().copies.push(Step::Run(Box::new(work)));
-        self.deferred().refreshed.clear();
+        let mut deferred = self.deferred();
+        deferred.copies.push(Step::Run(Box::new(work)));
+        deferred.refreshed.clear();
+        deferred.reached.clear();
     }
 
     /// As [`HostList::defer`], for work that writes only host memory.
@@ -1165,7 +1219,14 @@ impl HostList {
     fn run_deferred(&self, batch: &mut Batch) {
         #[cfg(feature = "diagnostics")]
         use crate::copystat::{C, add};
-        for step in &self.deferred().copies {
+        let mut deferred = self.deferred();
+        let Deferred {
+            copies,
+            reached_plans,
+            ..
+        } = &mut *deferred;
+        reached_plans.clear();
+        for step in copies.iter() {
             let started = std::time::Instant::now();
             let copied = match step {
                 &Step::Copy(dst, src, len) => {
@@ -1214,6 +1275,20 @@ impl HostList {
                     shadow.writing(*address, *len);
                     continue;
                 }
+                &Step::Reached(heap, writes) => {
+                    let Some(plan) = crate::descriptor::reached_plan(heap) else {
+                        continue;
+                    };
+                    batch.reach(&plan);
+                    if writes && !plan.writes.is_empty() {
+                        batch.flush();
+                        for (shadow, address, len) in &plan.writes {
+                            shadow.writing(*address, *len);
+                        }
+                    }
+                    reached_plans.push((plan, writes));
+                    continue;
+                }
                 Step::Texture(staging) => {
                     if batch.texture_due(staging) {
                         staging.refresh();
@@ -1240,6 +1315,9 @@ struct Batch {
     refreshes: Vec<(std::sync::Arc<crate::shadow::Shadow>, usize, usize)>,
     /// Staging buffers (by address) refreshed since the last title write.
     textures: std::collections::HashSet<usize>,
+    /// Heaps' run-time-picked buffer views brought up to date since the
+    /// last title write: most lists of a submission share one view heap.
+    reached: Vec<std::sync::Arc<crate::descriptor::host::ReachedPlan>>,
 }
 
 impl Batch {
@@ -1261,11 +1339,38 @@ impl Batch {
         self.textures.insert(std::sync::Arc::as_ptr(staging) as *const () as usize)
     }
 
+    /// Brings what a heap's buffer views read up to date for shaders that
+    /// pick their view at run time ([`Step::Reached`]): each host copy's
+    /// range on its own, once per submission until a step writes title
+    /// memory. Not through [`Batch::add`], which looks its copy up among
+    /// the pending ones one by one: a heap views thousands of copies.
+    fn reach(&mut self, plan: &std::sync::Arc<crate::descriptor::host::ReachedPlan>) {
+        if self
+            .reached
+            .iter()
+            .any(|p| std::sync::Arc::ptr_eq(p, plan))
+        {
+            return;
+        }
+        self.reached.push(plan.clone());
+        let started = std::time::Instant::now();
+        let mut copied = 0;
+        for (shadow, address, len) in &plan.reads {
+            copied += shadow.update(*address, *len);
+        }
+        REACHED[0].fetch_add(1, Ordering::Relaxed);
+        REACHED[1].fetch_add(plan.reads.len() as u64, Ordering::Relaxed);
+        REACHED[2].fetch_add(copied as u64, Ordering::Relaxed);
+        PREPARING[0].fetch_add(started.elapsed().as_micros() as u64, Ordering::Relaxed);
+        PREPARING[1].fetch_add(copied as u64, Ordering::Relaxed);
+    }
+
     /// Before a step that writes title memory: pending refreshes are done
     /// first, and textures are checked again after it.
     fn title_written(&mut self) {
         self.flush();
         self.textures.clear();
+        self.reached.clear();
     }
 
     fn flush(&mut self) {

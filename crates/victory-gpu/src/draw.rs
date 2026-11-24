@@ -447,6 +447,21 @@ impl State {
             list.keep(&p.pso);
             list.keep(&p.root);
         }
+        // A shader that picks the slot of a buffer view when it runs: no
+        // table below names what it reads, so every buffer view of the heap
+        // is made, and their data copied when the list is submitted.
+        let picked = p
+            .stages
+            .iter()
+            .fold(0, |all, s| all | s.translated().host.run_time_buffers);
+        if picked != 0
+            && self.heaps[0] != 0
+            && let Some(host) = crate::descriptor::heap(self.heaps[0] as This).host()
+        {
+            use victory_shader::emit::HostShader;
+            host.reach();
+            list.defer_reached(self.heaps[0], picked & HostShader::RUN_TIME_WRITES != 0);
+        }
         for stage in &p.stages {
             let t = stage.translated();
             let made = self.tables(list, &t.used, compute);
@@ -534,6 +549,11 @@ impl State {
             once!("a dispatch with a graphics pipeline");
             return;
         }
+        self.dispatch_with(list, p, x, y, z);
+    }
+
+    /// Runs a dispatch of the compute pipeline `p` on the host.
+    pub(crate) fn dispatch_with(&mut self, list: &HostList, p: &HostPipeline, x: u32, y: u32, z: u32) {
         self.bind(list, p, true);
         #[cfg(feature = "diagnostics")]
         list.note_op(|| self.op_text(format!("dispatch {x}x{y}x{z}"), true));

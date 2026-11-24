@@ -4,9 +4,15 @@
 //! order: slot `i` is made from what the title wrote at slot `i`, when it
 //! writes it (view creation and descriptor copies) and again when a draw
 //! reads it through a table and finds the slot changed.
+//!
+//! Buffer views wait for a draw that names their slot, with one exception:
+//! a shader that picks its slot when it runs (an index it loads, say) has
+//! no table naming what it reads, so the first such shader to use a heap
+//! has every buffer view of the heap made ([`Reached`]).
 
-use std::collections::HashMap;
-use std::sync::Mutex;
+use std::collections::{BTreeMap, HashMap};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 
 use victory_shader::emit::{RawWindow, StrideEntry};
 use windows::Win32::Graphics::Direct3D12::*;
@@ -14,6 +20,7 @@ use windows::Win32::Graphics::Dxgi::Common::*;
 
 use super::{VIEW_TAG, View, view_at};
 use crate::host::host;
+use crate::shadow::Shadow;
 
 pub(crate) struct HostHeap {
     pub(crate) heap: ID3D12DescriptorHeap,
@@ -39,7 +46,83 @@ pub(crate) struct HostHeap {
     /// heaps), and which slots have a raw view there.
     alias_base: u32,
     aliases: Mutex<Aliases>,
+    /// Whether a shader that picks slots when it runs has used the heap
+    /// ([`HostHeap::reach`]): from then on buffer views are made when the
+    /// title writes them. Set under `made`'s lock, once the views that
+    /// waited are made; read under it to decide whether a view waits.
+    reaching: AtomicBool,
+    /// The buffer views in the title's slots, for such shaders. Locked
+    /// after `made`, never before it.
+    reached: Mutex<Reached>,
 }
+
+/// The buffer views the title has in a view heap, for shaders that pick a
+/// slot when they run (`HostShader::run_time_buffers`): no used-resource
+/// entry names the slot such a shader reads, and the index may come from
+/// GPU memory, so the host cannot tell which before the shader runs. Every
+/// buffer view of the heap is made once such a shader uses the heap, and
+/// the title memory they read is brought up to date for each submission
+/// that runs one ([`ReachedPlan`]).
+///
+/// shortcut: only shader resource and unordered access views of buffers; a
+/// constant buffer or a texture in memory the title placed itself, in a
+/// slot reached only this way, stays null (the host wants constant buffers
+/// 256-byte aligned, and such a texture uploaded). Only slots the title
+/// writes through the device (view creation, descriptor copies) are seen:
+/// a title that copies descriptor bytes itself into a slot only reached
+/// this way leaves the host slot as it was.
+#[derive(Default)]
+struct Reached {
+    /// Slots whose buffer view waits to be made: the record (view index
+    /// and generation) the title wrote there.
+    waiting: BTreeMap<u32, u64>,
+    /// Slots whose buffer view is made, with what it reads.
+    live: BTreeMap<u32, Reach>,
+    /// What submissions do for `live`, until it changes.
+    plan: Option<Arc<ReachedPlan>>,
+    /// The count of released views ([`super::released`]) `live` was last
+    /// looked through for stale ones at.
+    released: u64,
+    /// Views made for such shaders so far (the ones that waited, and those
+    /// made as the title wrote them).
+    views: u64,
+}
+
+/// A made buffer view: the record it was made from, and the title memory it
+/// reads (its host copy, address, bytes), written too through an unordered
+/// access view.
+struct Reach {
+    key: u64,
+    shadow: Arc<Shadow>,
+    address: usize,
+    len: usize,
+    unordered: bool,
+}
+
+/// What a submission running a shader that picks slots at run time does for
+/// a heap's buffer views.
+#[derive(Default)]
+pub(crate) struct ReachedPlan {
+    /// Title memory the views read (host copy, address, bytes), one range
+    /// per host copy: the one covering its views, as a submission's
+    /// refreshes of one copy are merged.
+    pub(crate) reads: Vec<(Arc<Shadow>, usize, usize)>,
+    /// Title memory shaders may write through the unordered access views,
+    /// ranges that touch merged.
+    pub(crate) writes: Vec<(Arc<Shadow>, usize, usize)>,
+}
+
+/// Unordered access views of more bytes than this, in slots only reached by
+/// an index computed at run time, are not copied back to title memory.
+///
+/// shortcut: what shaders write through such a view stays in the host copy
+/// (the title's CPU does not see it, and a refresh of memory that cannot be
+/// write-watched puts the title's bytes back over it). Copy-back keeps a
+/// range's bytes from before each submission to find what shaders wrote,
+/// and every such view counts as written whenever a shader that may write
+/// one runs; a view of the title's big GPU heap would cost a copy of it
+/// per submission. Views named by tables have no such limit.
+const REACHED_WRITE: usize = 16 << 20;
 
 /// The raw views of the bytes structured and typed buffer views read, for
 /// shaders that read such a buffer without knowing its stride: they take a
@@ -231,6 +314,8 @@ impl HostHeap {
                 free: Vec::new(),
                 next: NULL_ALIASES,
             }),
+            reaching: AtomicBool::new(false),
+            reached: Mutex::default(),
         };
         // A slot never written is undefined: shaders reading one (a slot
         // the title wrote in a way we do not know, or a table entry no
@@ -460,7 +545,10 @@ impl HostHeap {
     /// Makes host slot `index` from the record the title has at `handle`
     /// if it changed since, and returns the view recorded there. Buffer
     /// views are made only for draws (`for_draw`), which also copy their
-    /// data: a host copy of a buffer is made on first use.
+    /// data: a host copy of a buffer is made on first use. Once a shader
+    /// that picks slots when it runs has used the heap ([`HostHeap::reach`])
+    /// they are made here too, and submissions running such shaders copy
+    /// their data.
     pub(crate) fn mirror(&self, index: u32, handle: u64, for_draw: bool) -> Option<View> {
         if index >= self.count {
             // Diagnostic (NVIDIA heap cap): the highest title slot past the
@@ -489,23 +577,209 @@ impl HostHeap {
                 made[index as usize] = 0;
                 self.make_null(index);
             }
+            self.unreach(index);
             return None;
         };
         if made[index as usize] != key {
-            let later = !for_draw && view.is_buffer();
+            // Under `made`'s lock: a view that waits is in `waiting` before
+            // `reach` looks there.
+            let reaching = self.reaching.load(Ordering::Relaxed) && reached_kind(&view);
+            let later = !for_draw && view.is_buffer() && !reaching;
             made[index as usize] = if later { 0 } else { key };
-            let kept = if later {
-                None
-            } else {
-                make(&view, self.cpu(index))
-            };
-            if kept.is_none() && !self.sampler {
-                null_for(&view, self.cpu(index));
+            self.make_slot(index, key, &view, later);
+            if reaching && !for_draw {
+                self.reached().views += 1;
             }
-            self.note_view(index, &view, kept.as_ref());
-            self.keep(index, kept.flatten());
         }
         Some(view)
+    }
+
+    /// Makes slot `index` (one of the title's) from `view`, whose record is
+    /// `key`, or leaves it null to be made `later`; with its runtime stride
+    /// table entry, its raw view and what shaders that pick slots at run
+    /// time need of it. The caller holds `made`'s lock, so the slot's view,
+    /// entry and raw view change together.
+    fn make_slot(&self, index: u32, key: u64, view: &View, later: bool) {
+        let kept = if later {
+            None
+        } else {
+            make(view, self.cpu(index))
+        };
+        if kept.is_none() && !self.sampler {
+            null_for(view, self.cpu(index));
+        }
+        self.note_view(index, view, kept.as_ref());
+        if !self.sampler {
+            self.note_reach(index, key, view, later, kept.is_some());
+        }
+        self.keep(index, kept.flatten());
+    }
+
+    fn reached(&self) -> std::sync::MutexGuard<'_, Reached> {
+        self.reached.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Slot `index` holds no buffer view any more.
+    fn unreach(&self, index: u32) {
+        if self.sampler {
+            return;
+        }
+        let mut r = self.reached();
+        r.waiting.remove(&index);
+        if r.live.remove(&index).is_some() {
+            r.plan = None;
+        }
+    }
+
+    /// Slot `index` was just made from `view` (`made`: the host made it),
+    /// or left null to be made `later`.
+    fn note_reach(&self, index: u32, key: u64, view: &View, later: bool, made: bool) {
+        let reach = (made && !later).then(|| reach_of(key, view)).flatten();
+        let waits = later && reached_kind(view);
+        let mut r = self.reached();
+        if waits {
+            r.waiting.insert(index, key);
+        } else {
+            r.waiting.remove(&index);
+        }
+        let changed = match reach {
+            Some(reach) => {
+                r.live.insert(index, reach);
+                true
+            }
+            None => r.live.remove(&index).is_some(),
+        };
+        if changed {
+            r.plan = None;
+        }
+    }
+
+    /// A shader that picks view-heap slots when it runs is about to use the
+    /// heap: the buffer views that waited for a draw to name them are made,
+    /// and from now on they are made when the title writes them, as other
+    /// views are.
+    pub(crate) fn reach(&self) {
+        if self.sampler || self.reaching.load(Ordering::Acquire) {
+            return;
+        }
+        let mut made = self.made.lock().unwrap_or_else(|e| e.into_inner());
+        if self.reaching.load(Ordering::Acquire) {
+            return; // another list's shader got here first, and is done
+        }
+        let waiting = std::mem::take(&mut self.reached().waiting);
+        let mut n = 0;
+        for (index, key) in waiting {
+            // A view whose resource the title released since stays null.
+            let Some(view) = view_at(key as u32, (key >> 32) as u32) else {
+                continue;
+            };
+            made[index as usize] = key;
+            self.make_slot(index, key, &view, false);
+            n += 1;
+        }
+        self.reached().views += n;
+        // Only now: a list that finds it set records (and may be submitted)
+        // without waiting, so the views must all be made.
+        self.reaching.store(true, Ordering::Release);
+        tracing::debug!(
+            views = n,
+            "buffer views made for shaders that pick their slot when they run"
+        );
+    }
+
+    /// What a submission running a shader that picks slots when it runs
+    /// does for the heap's buffer views, as they are now. Views whose
+    /// resource the title released since the last look are made null first
+    /// (their memory may be another resource's by now).
+    pub(crate) fn reached_plan(&self) -> Arc<ReachedPlan> {
+        let released = super::released();
+        let stale = {
+            let r = self.reached();
+            if r.released == released {
+                if let Some(plan) = &r.plan {
+                    return plan.clone();
+                }
+                Vec::new()
+            } else {
+                super::stale(r.live.iter().map(|(&index, reach)| (index, reach.key)))
+            }
+        };
+        if !stale.is_empty() {
+            let mut made = self.made.lock().unwrap_or_else(|e| e.into_inner());
+            for (index, key) in stale {
+                // Unless the title wrote the slot again meanwhile.
+                if made[index as usize] == key {
+                    made[index as usize] = 0;
+                    self.make_null(index);
+                    self.unreach(index);
+                }
+            }
+        }
+        let mut r = self.reached();
+        r.released = released;
+        if let Some(plan) = &r.plan {
+            return plan.clone();
+        }
+        let mut plan = ReachedPlan::default();
+        let mut copies: HashMap<usize, usize> = HashMap::new();
+        let mut skipped = 0;
+        for reach in r.live.values() {
+            let end = reach.address + reach.len;
+            match copies.entry(Arc::as_ptr(&reach.shadow) as usize) {
+                std::collections::hash_map::Entry::Occupied(at) => {
+                    let (_, address, len) = &mut plan.reads[*at.get()];
+                    let from = (*address).min(reach.address);
+                    (*address, *len) = (from, (*address + *len).max(end) - from);
+                }
+                std::collections::hash_map::Entry::Vacant(at) => {
+                    at.insert(plan.reads.len());
+                    plan.reads
+                        .push((reach.shadow.clone(), reach.address, reach.len));
+                }
+            }
+            if reach.unordered && reach.len <= REACHED_WRITE {
+                plan.writes
+                    .push((reach.shadow.clone(), reach.address, reach.len));
+            } else if reach.unordered {
+                skipped += 1;
+            }
+        }
+        // Whole pages: a page copied in part stays stale, and would be
+        // copied again by every submission. (Where shaders are writing,
+        // the refresh leaves the copy alone.)
+        for (shadow, address, len) in &mut plan.reads {
+            (*address, *len) = shadow.whole_pages(*address, *len);
+        }
+        if skipped > 0 {
+            static ONCE: std::sync::Once = std::sync::Once::new();
+            ONCE.call_once(|| {
+                tracing::warn!(
+                    views = skipped,
+                    "unordered access views picked at run time too big to copy back to title memory"
+                )
+            });
+        }
+        // Ranges of one copy that touch, as one.
+        plan.writes
+            .sort_unstable_by_key(|(shadow, address, _)| (Arc::as_ptr(shadow) as usize, *address));
+        plan.writes.dedup_by(|next, last| {
+            let touch = Arc::ptr_eq(&next.0, &last.0) && next.1 <= last.1 + last.2;
+            if touch {
+                last.2 = last.2.max(next.1 + next.2 - last.1);
+            }
+            touch
+        });
+        let plan = Arc::new(plan);
+        r.plan = Some(plan.clone());
+        plan
+    }
+
+    /// Views made for shaders that pick their slot at run time so far, and
+    /// how many buffer views the heap holds made now.
+    #[cfg(test)]
+    pub(crate) fn reached_counts(&self) -> (u64, usize) {
+        let r = self.reached();
+        (r.views, r.live.len())
     }
 
     /// The view host slot `index` was made from, in a few words, with the
@@ -820,6 +1094,39 @@ enum Viewed {
 /// Whether `view` is for unordered access.
 fn view_is_unordered(view: &View) -> bool {
     matches!(view, View::Unordered(..) | View::Placed(true, ..))
+}
+
+/// Whether `view` is a shader resource or unordered access view of a
+/// buffer: the views made for shaders that pick their slot at run time.
+fn reached_kind(view: &View) -> bool {
+    buffer_range(view).is_some()
+}
+
+/// What the buffer view `view` (record `key`), just made, reads: the host
+/// copy [`make`] made it on (found by the whole buffer, as there), and the
+/// title memory of its elements.
+fn reach_of(key: u64, view: &View) -> Option<Reach> {
+    let (address, len) = buffer_range(view)?;
+    let (base, whole) = match view {
+        View::Shader(r, _) | View::Unordered(r, _, _) => {
+            let (data, len) = crate::resource::buffer_bytes(*r as crate::object::This)?;
+            (data as u64, len)
+        }
+        View::Placed(_, resource, desc) => (
+            u64::from(desc[10]) | u64::from(desc[11]) << 32,
+            u64::from(resource[4]) | u64::from(resource[5]) << 32,
+        ),
+        _ => return None,
+    };
+    let shadow = crate::shadow::find(base, whole)?;
+    let len = len.min(shadow.left(address));
+    (len > 0).then(|| Reach {
+        key,
+        shadow,
+        address: address as usize,
+        len: len as usize,
+        unordered: view_is_unordered(view),
+    })
 }
 
 /// The bytes of its host copy the structured or typed buffer view `view`
