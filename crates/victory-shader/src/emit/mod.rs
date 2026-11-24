@@ -159,9 +159,23 @@ pub struct HostShader {
     /// True when the shader reads the runtime stride table (`t0` in
     /// [`STRIDE_SPACE`]).
     pub stride_table: bool,
+    /// Whether the shader makes buffer handles of view-heap slots it picks
+    /// with a value it computes or loads when it runs
+    /// ([`HostShader::RUN_TIME_READS`], [`HostShader::RUN_TIME_WRITES`]):
+    /// slots no [`crate::UsedResource`] names, so the host cannot tell
+    /// which before the shader runs and has every buffer view of the heap
+    /// ready.
+    pub run_time_buffers: u8,
 }
 
 impl HostShader {
+    /// [`HostShader::run_time_buffers`]: a buffer in a slot picked at run
+    /// time is read (as a shader resource or for unordered access).
+    pub const RUN_TIME_READS: u8 = 1;
+    /// [`HostShader::run_time_buffers`]: one is opened for unordered
+    /// access, so the shader may write it.
+    pub const RUN_TIME_WRITES: u8 = 2;
+
     /// Size of the user-data buffer the shader declares, in dwords (a
     /// multiple of 4; 0 when it reads none). Root constants must cover it.
     pub fn user_data_dwords(&self) -> u32 {
@@ -302,6 +316,7 @@ pub fn emit(
         root_cbvs: l.root_cbvs,
         root_srvs: l.root_srvs,
         stride_table: l.stride_table,
+        run_time_buffers: l.run_time_buffers,
     })
 }
 
@@ -497,6 +512,7 @@ mod tests {
             root_cbvs: Vec::new(),
             root_srvs: Vec::new(),
             stride_table: false,
+            run_time_buffers: 0,
         };
         let file = |var: &str, stage| {
             std::env::var(var).ok().map(|p| super::HostShader {
@@ -508,6 +524,7 @@ mod tests {
                 root_cbvs: Vec::new(),
                 root_srvs: Vec::new(),
                 stride_table: false,
+                run_time_buffers: 0,
             })
         };
         let ps = file("VICTORY_REF_PS", crate::HwStage::Ps).unwrap_or(ps);
@@ -694,6 +711,7 @@ mod tests {
             root_cbvs: l.root_cbvs,
             root_srvs: l.root_srvs,
             stride_table: l.stride_table,
+            run_time_buffers: l.run_time_buffers,
         }
     }
 
@@ -864,7 +882,7 @@ mod tests {
     #[test]
     fn structured_buffer_unknown_stride_uses_runtime_stride_table() {
         // Translated and validated on every host; run where there is a GPU.
-        let _ = unknown_stride_program(
+        let l = unknown_stride_program(
             &[
                 0xBE85_0380, // s_mov_b32 s5, 0
                 0xF408_0202,
@@ -878,6 +896,9 @@ mod tests {
             8,
             ONE_THREAD,
         );
+        // The slot is the table's first: the host knows it before the
+        // dispatch from the program's used-resource entries.
+        assert_eq!(l.run_time_buffers, 0);
         #[cfg(windows)]
         for (name, host) in hosts() {
             unknown_stride_views_read_their_bytes(name, &host);
@@ -925,6 +946,10 @@ mod tests {
                 threads: [4, 1, 1],
             },
         );
+        // The view read is in a slot the program picks when it runs: the
+        // host is told, since no used-resource entry names it. The view
+        // written is in the table's second slot.
+        assert_eq!(l.run_time_buffers, super::HostShader::RUN_TIME_READS);
         #[cfg(not(windows))]
         let _ = l;
         #[cfg(windows)]
@@ -1023,6 +1048,8 @@ mod tests {
             0xBF81_0000, // s_endpgm
         ];
         let l = unknown_stride_program(words, 16, ONE_THREAD);
+        // Either slot is at a constant offset of the table.
+        assert_eq!(l.run_time_buffers, 0);
         #[cfg(not(windows))]
         let _ = l;
         #[cfg(windows)]

@@ -36,6 +36,8 @@ pub(crate) struct Lowered {
     pub root_cbvs: Vec<u8>,
     pub root_srvs: Vec<u8>,
     pub stride_table: bool,
+    /// [`super::HostShader::run_time_buffers`].
+    pub run_time_buffers: u8,
     pub user_data: Vec<UserData>,
     pub samplers: Vec<[u32; 4]>,
 }
@@ -159,6 +161,8 @@ struct Lower<'a> {
     /// Runtime stride table entries read in a block, by the descriptor's
     /// load: the raw slot, the stride and the bias.
     entries: HashMap<(usize, Site, u8), [V; 3]>,
+    /// [`super::HostShader::run_time_buffers`], as handles are made.
+    run_time_buffers: u8,
     /// Blocks splitting the edge from one IR block to another.
     edges: HashMap<(usize, usize), usize>,
     /// Per IR block: a `done` export is behind every lane entering it.
@@ -465,6 +469,7 @@ impl<'a> Lower<'a> {
             interps: x.io.interps.iter().map(|(s, i)| (*s, i)).collect(),
             handles: HashMap::new(),
             entries: HashMap::new(),
+            run_time_buffers: 0,
             edges: HashMap::new(),
             exported: vec![false; p.blocks.len()],
             rpo: vec![usize::MAX; p.blocks.len()],
@@ -894,6 +899,7 @@ impl<'a> Lower<'a> {
             root_cbvs,
             root_srvs,
             stride_table,
+            run_time_buffers: self.run_time_buffers,
             dxil: self.s.finish(),
             user_data,
             samplers: self.samplers,
@@ -3208,6 +3214,38 @@ impl<'a> Lower<'a> {
             .max_by_key(|u| u.table_offset_dwords)
     }
 
+    /// Notes a buffer handle (`props`: its kind, with the UAV bit) made of
+    /// a view-heap slot the code picks when it runs: a descriptor loaded
+    /// from the view heap itself, or from a table at an offset that is not
+    /// a constant. No used-resource entry names such a slot.
+    fn note_run_time(&mut self, src: &Source, props: u32) {
+        const BUFFERS: std::ops::RangeInclusive<u32> = 10..=12;
+        const UAV: u32 = 0x1000;
+        if !BUFFERS.contains(&(props & 0xff)) {
+            return;
+        }
+        let picked = src.leaves().into_iter().any(|leaf| {
+            let Source::Loaded { load, .. } = leaf else {
+                return false;
+            };
+            self.scalar.get(load).is_some_and(|a| {
+                a.dynamic.is_some()
+                    || self
+                        .x
+                        .native
+                        .layout
+                        .get(a.param)
+                        .is_some_and(|p| p.root == RootType::ResourceHeap)
+            })
+        });
+        if picked {
+            self.run_time_buffers |= super::HostShader::RUN_TIME_READS;
+            if props & UAV != 0 {
+                self.run_time_buffers |= super::HostShader::RUN_TIME_WRITES;
+            }
+        }
+    }
+
     /// A handle for the descriptor `src` read at `site`.
     fn handle(
         &mut self,
@@ -3216,6 +3254,9 @@ impl<'a> Lower<'a> {
         sampler: bool,
         props: (u32, u32),
     ) -> Result<V, Why> {
+        if !sampler {
+            self.note_run_time(src, props.0);
+        }
         match src {
             Source::Loaded { load, first } => {
                 let key = (self.cur, *load, *first, sampler, props.0);
@@ -3397,6 +3438,7 @@ impl<'a> Lower<'a> {
         props: u32,
     ) -> Result<(V, V), Why> {
         let [raw, stride, bias] = self.stride_entry(src)?;
+        self.note_run_time(src, props);
         let c = self.cur;
         let element = self.s.m.bin(c, Bin::Mul, index, stride);
         let byte = self.s.m.bin(c, Bin::Add, element, off);
