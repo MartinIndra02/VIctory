@@ -1072,7 +1072,9 @@ fn selects_on_masks_held_as_numbers() {
         };
         for (label, body, by_group) in [("constant", &constant[..], false), ("built", &built, true)]
         {
-            for (wave64, threads) in [(true, 64), (false, 64), (false, 32)] {
+            // (128 threads of a wave64: two console waves, one host group
+            // each on a host without 64-lane waves.)
+            for (wave64, threads) in [(true, 64), (false, 64), (false, 32), (true, 128)] {
                 let mut p = program(body, threads);
                 p.wave64 = wave64;
                 let groups = 2;
@@ -1080,11 +1082,11 @@ fn selects_on_masks_held_as_numbers() {
                     .unwrap_or_else(|e| panic!("{name}: {label} wave64 {wave64}: {e}"));
                 let want: Vec<u32> = (0..groups)
                     .flat_map(|g| {
-                        // s8 = g * threads * 4: bit 8 in group 1 of 64, bit 7 of 32.
+                        // s8 = g * threads * 4: bit 8 in group 1 of 64, 7 of 32, 9 of 128.
                         let lo = 0x0F0F_0F0F | if by_group { g * threads * 4 } else { 0 };
                         (0..threads).map(move |t| {
-                            let (word, lane) = if wave64 && t >= 32 {
-                                (0x3333_3333, t - 32)
+                            let (word, lane) = if wave64 && t % 64 >= 32 {
+                                (0x3333_3333, t % 64 - 32)
                             } else {
                                 (lo, t % 32)
                             };
