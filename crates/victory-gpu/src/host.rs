@@ -48,6 +48,12 @@ pub(crate) struct Host {
     dsvs: ID3D12DescriptorHeap,
     dsv_size: u32,
     next_dsv: AtomicU32,
+    /// Matching non-shader-visible and shader-visible rings for
+    /// `ClearUnorderedAccessViewUint/Float`.
+    clear_uavs_cpu: ID3D12DescriptorHeap,
+    clear_uavs_gpu: ID3D12DescriptorHeap,
+    uav_size: u32,
+    next_uav: AtomicU32,
     /// With `VICTORY_D3D12_DEBUG` set (diagnostics builds): the debug
     /// layer's messages.
     messages: Option<ID3D12InfoQueue>,
@@ -207,6 +213,21 @@ fn create() -> windows::core::Result<Host> {
                 ..Default::default()
             })?;
         let dsv_size = device.GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_DSV);
+        let clear_uavs_cpu: ID3D12DescriptorHeap =
+            device.CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC {
+                Type: D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,
+                NumDescriptors: RTV_RING,
+                ..Default::default()
+            })?;
+        let clear_uavs_gpu: ID3D12DescriptorHeap =
+            device.CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC {
+                Type: D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,
+                NumDescriptors: RTV_RING,
+                Flags: D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE,
+                ..Default::default()
+            })?;
+        let uav_size =
+            device.GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
         tracing::info!("host D3D12 device ready");
         Ok(Host {
             device,
@@ -219,6 +240,10 @@ fn create() -> windows::core::Result<Host> {
             dsvs,
             dsv_size,
             next_dsv: AtomicU32::new(0),
+            clear_uavs_cpu,
+            clear_uavs_gpu,
+            uav_size,
+            next_uav: AtomicU32::new(0),
             messages,
             next_rtv: AtomicU32::new(0),
             presenter: Mutex::new(None),
@@ -778,6 +803,44 @@ impl Host {
             self.device
                 .CreateDepthStencilView(resource, desc.map(|d| d as *const _), handle);
             handle
+        }
+    }
+
+    /// A matching `(shader-visible heap, GPU handle, CPU-only handle)` UAV
+    /// pair for `ClearUnorderedAccessViewUint/Float`, valid until recorded.
+    pub(crate) fn clear_uav(
+        &self,
+        resource: &ID3D12Resource,
+        desc: Option<&D3D12_UNORDERED_ACCESS_VIEW_DESC>,
+    ) -> (
+        &ID3D12DescriptorHeap,
+        D3D12_GPU_DESCRIPTOR_HANDLE,
+        D3D12_CPU_DESCRIPTOR_HANDLE,
+    ) {
+        let slot = self.next_uav.fetch_add(1, Ordering::Relaxed) % RTV_RING;
+        let step = (slot * self.uav_size) as usize;
+        // SAFETY: live heaps and resource; slot is in bounds of both rings.
+        unsafe {
+            let mut cpu = self.clear_uavs_cpu.GetCPUDescriptorHandleForHeapStart();
+            cpu.ptr += step;
+            let mut gpu_cpu = self.clear_uavs_gpu.GetCPUDescriptorHandleForHeapStart();
+            gpu_cpu.ptr += step;
+            let mut gpu = self.clear_uavs_gpu.GetGPUDescriptorHandleForHeapStart();
+            gpu.ptr += step as u64;
+            let desc_ptr = desc.map(|d| d as *const _);
+            self.device.CreateUnorderedAccessView(
+                resource,
+                None::<&ID3D12Resource>,
+                desc_ptr,
+                cpu,
+            );
+            self.device.CreateUnorderedAccessView(
+                resource,
+                None::<&ID3D12Resource>,
+                desc_ptr,
+                gpu_cpu,
+            );
+            (&self.clear_uavs_gpu, gpu, cpu)
         }
     }
 }

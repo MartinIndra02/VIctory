@@ -568,6 +568,122 @@ fn buffer_uav(
     Some(Some(shadow.buffer.clone()))
 }
 
+/// Host target for `ClearUnorderedAccessViewUint/Float`.
+pub(crate) enum ClearTarget {
+    /// A shadow-backed buffer UAV (raw or typed; structured buffers cannot be
+    /// cleared in D3D12).
+    Buffer {
+        shadow: std::sync::Arc<crate::shadow::Shadow>,
+        address: u64,
+        len: u64,
+        desc: D3D12_UNORDERED_ACCESS_VIEW_DESC,
+    },
+    /// A resource-backed host texture UAV.
+    Texture {
+        resource: crate::object::This,
+        desc: Option<D3D12_UNORDERED_ACCESS_VIEW_DESC>,
+    },
+}
+
+/// Resolves a title UAV `view` (and `resource` pointer from `ClearUnorderedAccessView*`)
+/// into a host buffer or texture clear target.
+pub(crate) fn clear_uav_target(
+    view: &View,
+    resource: crate::object::This,
+) -> Option<ClearTarget> {
+    let (target_res, placed_addr, words): (crate::object::This, Option<u64>, Option<&[u32; 10]>) =
+        match view {
+            View::Unordered(r, _, desc) => {
+                let res = if !resource.is_null() {
+                    resource
+                } else {
+                    *r as crate::object::This
+                };
+                (res, None, desc.as_ref())
+            }
+            View::Placed(true, res_words, desc_words) => {
+                let addr = u64::from(desc_words[10]) | u64::from(desc_words[11]) << 32;
+                let w: &[u32; 10] = desc_words[..10].try_into().ok()?;
+                if res_words[0] == 1 {
+                    (std::ptr::null(), Some(addr), Some(w))
+                } else {
+                    (resource, None, Some(w))
+                }
+            }
+            _ => return None,
+        };
+
+    // Buffer UAV (either committed/placed title buffer or placed descriptor).
+    let buf_base = placed_addr.or_else(|| {
+        crate::resource::buffer_bytes(target_res).map(|(p, _)| p as u64)
+    });
+    if let (Some(base), Some(words)) = (buf_base, words) {
+        let mut desc = uav_desc(words);
+        if desc.ViewDimension != D3D12_UAV_DIMENSION_BUFFER {
+            return None;
+        }
+        // SAFETY: `ViewDimension == BUFFER` selects the `Buffer` union field.
+        let buffer = unsafe { &mut desc.Anonymous.Buffer };
+        if buffer.NumElements == 0 {
+            return None;
+        }
+        if buffer.StructureByteStride > 0 {
+            once!(
+                stride = buffer.StructureByteStride,
+                "ClearUnorderedAccessView on a structured buffer UAV is not allowed in D3D12"
+            );
+            return None;
+        }
+        let is_raw = buffer.Flags.0 & D3D12_BUFFER_UAV_FLAG_RAW.0 != 0;
+        let element = if is_raw {
+            4
+        } else {
+            crate::resource::element(desc.Format.0 as u32)?.0
+        };
+        if element == 0 {
+            return None;
+        }
+        let address = base.checked_add(buffer.FirstElement.checked_mul(element)?)?;
+        let len = u64::from(buffer.NumElements).checked_mul(element)?;
+        let shadow = crate::shadow::find(address, len)?;
+        // SAFETY: a live buffer.
+        let flags = unsafe { shadow.buffer.GetDesc() }.Flags;
+        if flags.0 & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS.0 == 0 {
+            return None;
+        }
+        let base_off = shadow.offset(base);
+        if !base_off.is_multiple_of(element) {
+            return None;
+        }
+        buffer.FirstElement += base_off / element;
+        buffer.CounterOffsetInBytes = 0;
+        if is_raw {
+            // Raw UAVs require 16-byte FirstElement alignment in D3D12; a typed
+            // R32_UINT view of the same dwords clears identically at any 4-byte
+            // FirstElement without alignment faults.
+            desc.Format = windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_R32_UINT;
+            buffer.Flags = D3D12_BUFFER_UAV_FLAG_NONE;
+        }
+        return Some(ClearTarget::Buffer {
+            shadow,
+            address,
+            len,
+            desc,
+        });
+    }
+
+    // Resource-backed texture UAV.
+    let texture = crate::resource::host_resource(target_res)?;
+    let mut desc = words.map(uav_desc);
+    if !fits(texture, desc.as_mut().map(|d| &mut d.Format), true) {
+        return None;
+    }
+    Some(ClearTarget::Texture {
+        resource: target_res,
+        desc,
+    })
+}
+
 /// Whether the host can make a shader (or unordered access) view of
 /// `texture` in `format` (none: the texture's own). The console allows any
 /// view; the host refuses (and removes the device for) views without the

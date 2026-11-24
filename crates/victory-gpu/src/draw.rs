@@ -958,6 +958,13 @@ impl State {
 }
 
 impl State {
+    /// Forces the next draw or dispatch to rebind the title's descriptor heaps
+    /// and root signatures (e.g. after an internal clear heap was bound).
+    pub(crate) fn invalidate_heaps(&mut self) {
+        self.host_heaps = [0; 2];
+        self.host_roots = [0; 2];
+    }
+
     /// Indirect execution of a one-argument signature of `kind` (PC
     /// numbering: 0 draw, 1 indexed draw, 2 dispatch, 10 mesh dispatch) with
     /// records `stride` bytes apart at title address `arguments`, and the

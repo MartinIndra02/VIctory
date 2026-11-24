@@ -762,6 +762,169 @@ extern "system" fn clear_dsv(
     let _ = (this, handle, flags, depth, stencil, count, rects);
 }
 
+/// `ClearUnorderedAccessViewUint(gpu_handle, cpu_handle, resource, values, count, rects)`.
+extern "system" fn clear_uav_uint(
+    this: This,
+    gpu_handle: u64,
+    cpu_handle: u64,
+    resource: This,
+    values: *const [u32; 4],
+    count: u32,
+    rects: *const Rect,
+) {
+    #[cfg(windows)]
+    {
+        // SAFETY: the title passes four uints (null is tolerated).
+        let Some(values) = (unsafe { values.as_ref() }) else {
+            return;
+        };
+        clear_uav(
+            this,
+            gpu_handle,
+            cpu_handle,
+            resource,
+            ClearValues::Uint(values),
+            count,
+            rects,
+        );
+    }
+    #[cfg(not(windows))]
+    let _ = (this, gpu_handle, cpu_handle, resource, values, count, rects);
+}
+
+/// `ClearUnorderedAccessViewFloat(gpu_handle, cpu_handle, resource, values, count, rects)`.
+extern "system" fn clear_uav_float(
+    this: This,
+    gpu_handle: u64,
+    cpu_handle: u64,
+    resource: This,
+    values: *const [f32; 4],
+    count: u32,
+    rects: *const Rect,
+) {
+    #[cfg(windows)]
+    {
+        // SAFETY: the title passes four floats (null is tolerated).
+        let Some(values) = (unsafe { values.as_ref() }) else {
+            return;
+        };
+        clear_uav(
+            this,
+            gpu_handle,
+            cpu_handle,
+            resource,
+            ClearValues::Float(values),
+            count,
+            rects,
+        );
+    }
+    #[cfg(not(windows))]
+    let _ = (this, gpu_handle, cpu_handle, resource, values, count, rects);
+}
+
+#[cfg(windows)]
+enum ClearValues<'a> {
+    Uint(&'a [u32; 4]),
+    Float(&'a [f32; 4]),
+}
+
+#[cfg(windows)]
+fn clear_uav(
+    this: This,
+    gpu_handle: u64,
+    cpu_handle: u64,
+    resource: This,
+    values: ClearValues<'_>,
+    count: u32,
+    rects: *const Rect,
+) {
+    use crate::descriptor::host::{ClearTarget, clear_uav_target};
+    use windows::Win32::Graphics::Direct3D12::{
+        D3D12_RESOURCE_BARRIER, D3D12_RESOURCE_STATES as State,
+    };
+
+    let Some(view) = crate::descriptor::view(cpu_handle).or_else(|| crate::descriptor::view(gpu_handle))
+    else {
+        return;
+    };
+    let Some(target) = clear_uav_target(&view, resource) else {
+        return;
+    };
+    let Some(host) = crate::host::host() else {
+        return;
+    };
+    let rects: &[windows::Win32::Foundation::RECT] = if count > 0 && !rects.is_null() {
+        // SAFETY: the title passes `count` rectangles, laid out as the host's.
+        unsafe { std::slice::from_raw_parts(rects.cast(), count as usize) }
+    } else {
+        &[]
+    };
+    // SAFETY: `UAV_BARRIER` has the exact layout of `D3D12_RESOURCE_BARRIER`.
+    let uav_barrier = unsafe { std::mem::transmute::<Barrier, D3D12_RESOURCE_BARRIER>(UAV_BARRIER) };
+
+    with_state(this, |list, state| match target {
+        ClearTarget::Buffer {
+            shadow,
+            address,
+            len,
+            desc,
+        } => {
+            shadow.refresh(list, address, len);
+            shadow.gpu_writes(list, address, len);
+            let (heap, gpu, cpu) = host.clear_uav(&shadow.buffer, Some(&desc));
+            state.invalidate_heaps();
+            // SAFETY: an open list, matching CPU/GPU UAV pair, live shadow buffer
+            // kept alive by `refresh`/`gpu_writes` and in COMMON/UAV state.
+            unsafe {
+                list.list.ResourceBarrier(std::slice::from_ref(&uav_barrier));
+                list.list.SetDescriptorHeaps(&[Some(heap.clone())]);
+                match values {
+                    ClearValues::Uint(v) => {
+                        list.list
+                            .ClearUnorderedAccessViewUint(gpu, cpu, &shadow.buffer, v, rects);
+                    }
+                    ClearValues::Float(v) => {
+                        list.list
+                            .ClearUnorderedAccessViewFloat(gpu, cpu, &shadow.buffer, v, rects);
+                    }
+                }
+                list.list.ResourceBarrier(std::slice::from_ref(&uav_barrier));
+            }
+        }
+        ClearTarget::Texture { resource, desc } => {
+            let Some(texture) = crate::resource::host_resource(resource) else {
+                return;
+            };
+            const UNORDERED_ACCESS: u32 = 0x8;
+            let (heap, gpu, cpu) = host.clear_uav(texture, desc.as_ref());
+            state.invalidate_heaps();
+            // SAFETY: an open list, matching CPU/GPU UAV pair, live texture.
+            unsafe {
+                if let Some((_, before)) = list.transition(resource, UNORDERED_ACCESS) {
+                    list.list.ResourceBarrier(&[crate::host::transition(
+                        texture,
+                        State(before as i32),
+                        State(UNORDERED_ACCESS as i32),
+                    )]);
+                }
+                list.list.SetDescriptorHeaps(&[Some(heap.clone())]);
+                match values {
+                    ClearValues::Uint(v) => {
+                        list.list
+                            .ClearUnorderedAccessViewUint(gpu, cpu, texture, v, rects);
+                    }
+                    ClearValues::Float(v) => {
+                        list.list
+                            .ClearUnorderedAccessViewFloat(gpu, cpu, texture, v, rects);
+                    }
+                }
+                list.list.ResourceBarrier(std::slice::from_ref(&uav_barrier));
+            }
+            crate::texture::host_written(resource);
+        }
+    });
+}
+
 /// `CopyMemoryToMemoryX(destination, source, size, flags)`: GPU addresses
 /// are title memory, copied at submission like buffer copies (if mapped).
 extern "system" fn copy_memory(this: This, dst: u64, src: u64, len: u64, _flags: u32) {
@@ -1284,7 +1447,7 @@ fn defer_write(this: This, address: u64, what: Written, bytes: usize) {
 /// layout): IUnknown 3, object 4, device child 1, list 1, graphics list 96
 /// (59 as on PC, then console ones), then versions 1-6 (6 + 1 + 1 + 11 + 3
 /// + 13): 140 slots.
-const METHODS: [(usize, *const ()); 52] = [
+const METHODS: [(usize, *const ()); 54] = [
     (0, list_query as *const ()),
     (2, list_release as *const ()),
     (7, object::parent_device as *const ()),      // 0x38
@@ -1325,6 +1488,8 @@ const METHODS: [(usize, *const ()); 52] = [
     (50, state::targets as *const ()),            // 0x190
     (51, clear_dsv as *const ()),                 // 0x198
     (52, clear_rtv as *const ()),                 // 0x1a0
+    (53, clear_uav_uint as *const ()),            // 0x1a8
+    (54, clear_uav_float as *const ()),           // 0x1b0
     (59, execute_indirect as *const ()),          // 0x1d8 indirect
     (60, copy_memory as *const ()),               // 0x1e0
     (68, ignored_state as *const ()),             // 0x220 depth bounds
@@ -1445,5 +1610,173 @@ mod tests {
         let release = |o: This| slot::<extern "system" fn(This) -> u32>(o, 0x10)(o);
         assert_eq!(release(list), 0);
         assert_eq!(release(allocator), 0);
+    }
+
+    /// End-to-end guest command-list test for `ClearUnorderedAccessViewUint`
+    /// (raw buffer at non-zero `FirstElement`) and
+    /// `ClearUnorderedAccessViewFloat` (typed `R32_FLOAT` buffer): verifies
+    /// cleared values are copied back into title memory while untouched
+    /// neighboring dwords remain intact, with zero D3D12 device removal.
+    #[cfg(windows)]
+    #[test]
+    fn buffer_uav_clears_write_back_to_title_memory() {
+        use crate::resource::{buffer_bytes, create_committed};
+        use windows::Win32::Graphics::Direct3D12::*;
+        use windows::Win32::Graphics::Dxgi::Common::DXGI_SAMPLE_DESC;
+        let Some(host) = crate::host::host() else {
+            return; // no host GPU here
+        };
+        let null = std::ptr::null();
+        let res_iid = crate::object::guid(
+            0x696442be,
+            0xa72e,
+            0x4059,
+            [0xbc, 0x79, 0x5b, 0x5c, 0x98, 0x04, 0x0f, 0xad],
+        );
+        let props: [u32; 5] = [1, 0, 0, 0, 0]; // DEFAULT heap
+        let make_buf = |size: u64| {
+            let desc = D3D12_RESOURCE_DESC {
+                Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
+                Width: size,
+                Height: 1,
+                DepthOrArraySize: 1,
+                MipLevels: 1,
+                SampleDesc: DXGI_SAMPLE_DESC {
+                    Count: 1,
+                    Quality: 0,
+                },
+                Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+                Flags: D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
+                ..Default::default()
+            };
+            let mut res = null;
+            assert_eq!(
+                create_committed(
+                    null,
+                    (&raw const props).cast(),
+                    0,
+                    (&raw const desc).cast(),
+                    0,
+                    null.cast(),
+                    &res_iid,
+                    &mut res,
+                ),
+                S_OK
+            );
+            res
+        };
+
+        let raw_buf = make_buf(64);
+        let float_buf = make_buf(64);
+        let (raw_ptr, _) = buffer_bytes(raw_buf).unwrap();
+        let (float_ptr, _) = buffer_bytes(float_buf).unwrap();
+        // Seed title buffers with known non-zero patterns.
+        // SAFETY: both title buffers are 64 bytes of committed title memory.
+        unsafe {
+            let raw_words = std::slice::from_raw_parts_mut(raw_ptr.cast::<u32>(), 16);
+            raw_words.fill(0xAAAA_AAAA);
+            let float_words = std::slice::from_raw_parts_mut(float_ptr.cast::<f32>(), 16);
+            float_words.fill(-1.0);
+        }
+
+        // Create a non-shader-visible CPU descriptor heap for two UAVs.
+        #[repr(C)]
+        struct HeapDesc {
+            kind: u32,
+            count: u32,
+            flags: u32,
+            node_mask: u32,
+            placement_addr: u64,
+            placement_size: u64,
+        }
+        let hdesc = HeapDesc {
+            kind: 0, // CBV_SRV_UAV
+            count: 4,
+            flags: 0,
+            node_mask: 0,
+            placement_addr: 0,
+            placement_size: 0,
+        };
+        let mut heap = null;
+        let heap_iid = crate::object::guid(
+            0x8efb471d,
+            0x616c,
+            0x4f49,
+            [0x90, 0xf7, 0x12, 0x7b, 0xb7, 0x63, 0xfa, 0x51],
+        );
+        assert_eq!(
+            crate::descriptor::create_heap(null, (&raw const hdesc).cast(), &heap_iid, &mut heap),
+            S_OK
+        );
+        let h0 = slot::<extern "system" fn(This) -> u64>(heap, 0x48)(heap);
+        let h1 = h0 + u64::from(crate::descriptor::increment_size(null, 0));
+
+        // Raw buffer UAV: FirstElement = 2, NumElements = 4 (dwords 2..6), R32_TYPELESS (39), RAW (1).
+        let raw_uav_desc: [u32; 10] = [39, 1, 2, 0, 4, 0, 0, 0, 1, 0];
+        crate::descriptor::create_uav(null, raw_buf, null, raw_uav_desc.as_ptr().cast(), h0);
+
+        // Typed R32_FLOAT (41) buffer UAV: FirstElement = 1, NumElements = 3 (dwords 1..4).
+        let float_uav_desc: [u32; 10] = [41, 1, 1, 0, 3, 0, 0, 0, 0, 0];
+        crate::descriptor::create_uav(null, float_buf, null, float_uav_desc.as_ptr().cast(), h1);
+
+        // Record both clears through the guest command list vtable slots 53 & 54.
+        let mut allocator = null;
+        assert_eq!(
+            create_allocator(null, 0, &ALLOCATOR_IIDS[0], &mut allocator),
+            S_OK
+        );
+        let mut list = null;
+        assert_eq!(
+            create_list(null, 0, 0, allocator, null, &LIST_IIDS[1], &mut list),
+            S_OK
+        );
+        let uint_vals = [0x1234_5678u32, 0, 0, 0];
+        let float_vals = [3.5f32, 0.0, 0.0, 0.0];
+        slot::<extern "system" fn(This, u64, u64, This, *const [u32; 4], u32, *const Rect)>(
+            list, 0x1a8,
+        )(list, 0, h0, raw_buf, &uint_vals, 0, null.cast());
+        slot::<extern "system" fn(This, u64, u64, This, *const [f32; 4], u32, *const Rect)>(
+            list, 0x1b0,
+        )(list, 0, h1, float_buf, &float_vals, 0, null.cast());
+        assert_eq!(slot::<extern "system" fn(This) -> HRESULT>(list, 0x48)(list), S_OK);
+
+        // Execute the guest list on the host GPU (triggers refresh + clear + copy-back).
+        // `close` (slot 0x48 above) already closed `hlist`.
+        let hlist = host_list(list).unwrap();
+        host.execute(&[hlist]);
+
+        // Verify title memory reflects the exact cleared ranges and preserved neighbors.
+        // SAFETY: GPU execution finished and copy-back completed.
+        unsafe {
+            let raw_words = std::slice::from_raw_parts(raw_ptr.cast::<u32>(), 8);
+            assert_eq!(
+                raw_words,
+                &[
+                    0xAAAA_AAAA,
+                    0xAAAA_AAAA,
+                    0x1234_5678,
+                    0x1234_5678,
+                    0x1234_5678,
+                    0x1234_5678,
+                    0xAAAA_AAAA,
+                    0xAAAA_AAAA,
+                ],
+                "raw buffer UAV uint clear should update dwords 2..6 only"
+            );
+            let float_words = std::slice::from_raw_parts(float_ptr.cast::<f32>(), 6);
+            assert_eq!(
+                float_words,
+                &[-1.0, 3.5, 3.5, 3.5, -1.0, -1.0],
+                "typed R32_FLOAT buffer UAV float clear should update dwords 1..4 only"
+            );
+            assert!(host.device.GetDeviceRemovedReason().is_ok());
+        }
+
+        let release = |o: This| slot::<extern "system" fn(This) -> u32>(o, 0x10)(o);
+        release(list);
+        release(allocator);
+        release(heap);
+        release(raw_buf);
+        release(float_buf);
     }
 }
