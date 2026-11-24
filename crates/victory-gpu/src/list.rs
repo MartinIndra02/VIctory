@@ -1193,6 +1193,9 @@ mod state {
         if indirect != 0 {
             static ONCE: std::sync::Once = std::sync::Once::new();
             ONCE.call_once(|| tracing::warn!("indirect mesh dispatches dropped"));
+            if let Some(list) = super::host_list(this) {
+                list.missed_draw();
+            }
             return;
         }
         with_state(this, |list, s| s.dispatch_mesh(list, x));
@@ -1296,6 +1299,10 @@ extern "system" fn execute_indirect(
     }
     if ran {
         return;
+    }
+    #[cfg(windows)]
+    if let Some(list) = host_list(this) {
+        list.missed_draw();
     }
     INDIRECT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     static SEEN: std::sync::Mutex<Vec<usize>> = std::sync::Mutex::new(Vec::new());
