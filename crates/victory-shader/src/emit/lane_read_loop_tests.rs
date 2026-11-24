@@ -13,13 +13,7 @@
 //! run in the console flow (`lower::CONSOLE_FLOW`) on every host. Run on
 //! every hardware adapter; each wrong lane is listed.
 
-use windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_12_0;
-use windows::Win32::Graphics::Direct3D12::{D3D12CreateDevice, ID3D12Device};
-use windows::Win32::Graphics::Dxgi::{
-    CreateDXGIFactory1, DXGI_ADAPTER_FLAG_SOFTWARE, IDXGIAdapter1, IDXGIFactory1,
-};
-
-use super::host::{Dispatch, Host, Root, View};
+use super::host::{Dispatch, Host, Root, View, adapters};
 use crate::native::{ComputeIo, RootParam, RootType, StageIo};
 
 /// The program for waves of `wave` lanes, one wave per group, reading
@@ -87,33 +81,24 @@ fn program(wave: u32, lane: u32) -> crate::NativeProgram {
     }
 }
 
-/// Every hardware adapter's device, by name.
+/// Every hardware adapter's device that runs SM 6.6, by name. (Without
+/// the Agility SDK, Windows 10 offers none: the test then has nothing to
+/// run on, as in `split_tests`.)
 fn devices() -> Vec<(String, Host)> {
-    let mut out = Vec::new();
-    // SAFETY: plain DXGI and D3D12 calls with valid out pointers.
-    unsafe {
-        let Ok(factory) = CreateDXGIFactory1::<IDXGIFactory1>() else {
-            return out;
-        };
-        let mut i = 0;
-        while let Ok(a) = factory.EnumAdapters1(i) {
-            i += 1;
-            let a: IDXGIAdapter1 = a;
-            let Ok(d) = a.GetDesc1() else { continue };
-            if d.Flags & DXGI_ADAPTER_FLAG_SOFTWARE.0 as u32 != 0 {
-                continue;
+    let Ok(names) = adapters() else {
+        eprintln!("no DXGI; skipped");
+        return Vec::new();
+    };
+    names
+        .into_iter()
+        .filter_map(|name| match Host::on(&name) {
+            Ok(host) => Some((name, host)),
+            Err(e) => {
+                eprintln!("{name}: no SM 6.6 device ({e}); skipped");
+                None
             }
-            let n = d.Description.iter().position(|&c| c == 0).unwrap_or(128);
-            let name = String::from_utf16_lossy(&d.Description[..n]);
-            let mut device: Option<ID3D12Device> = None;
-            if D3D12CreateDevice(&a, D3D_FEATURE_LEVEL_12_0, &mut device).is_ok()
-                && let Some(device) = device
-            {
-                out.push((name, Host { device }));
-            }
-        }
-    }
-    out
+        })
+        .collect()
 }
 
 fn emit(native: &crate::NativeProgram, target: super::Target) -> super::HostShader {
@@ -173,6 +158,9 @@ fn lane_reads_in_a_loop_lanes_leave_at_different_iterations() {
             }
         }
     }
-    assert!(ran > 0, "no adapter ran the program");
+    if ran == 0 {
+        eprintln!("no SM 6.6 hardware device; skipped");
+        return;
+    }
     assert!(wrong.is_empty(), "wrong on {wrong:?}");
 }
